@@ -1,171 +1,248 @@
+import 'dart:async';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
-void main() {
-  runApp(const MyApp());
-}
+void main() => runApp(const MaterialApp(home: LatencyCompareDemo()));
 
-// ---------------- Main App ----------------
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
-
+class LatencyCompareDemo extends StatefulWidget {
+  const LatencyCompareDemo({super.key});
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'RAW Baseline Latency Demo',
-      theme: ThemeData.dark(),
-      home: const StressTestPage(),
-    );
-  }
+  State<LatencyCompareDemo> createState() => _LatencyCompareDemoState();
 }
 
-// ---------------- Stress Test Page (Baseline) ----------------
-class StressTestPage extends StatefulWidget {
-  const StressTestPage({super.key});
-
-  @override
-  State<StressTestPage> createState() => _StressTestPageState();
-}
-
-class _StressTestPageState extends State<StressTestPage>
+class _LatencyCompareDemoState extends State<LatencyCompareDemo>
     with SingleTickerProviderStateMixin {
-  final List<Offset> _points = [];
-  late AnimationController _animationController;
+  final List<Offset> points = [];
+  final List<int> latencies = [];
+  int lastTime = 0;
+  static const int maxPts = 300;
+  bool useFastPath = false;
 
-  // Latency Measurement
-  final List<int> _rawLatency = [];
-  static const int maxSamples = 8;
+  Isolate? worker;
+  SendPort? workerPort;
+  final receivePort = ReceivePort();
+  late final FastClassifier classifier;
 
-  // GPU stress spheres
-  final int numSpheres = 200;
+  // ---------------- 3D spheres ----------------
+  late final AnimationController sphereController;
+  int numSpheres = 50;
   final List<double> rotationSpeeds = [];
   final List<double> phaseOffsets = [];
-
-  // Debounce
-  int _lastUpdateTime = 0;
 
   @override
   void initState() {
     super.initState();
+    classifier = FastClassifier();
+    _spawnWorker();
 
-    _animationController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 10),
-    )..repeat();
-
-    for (int i = 0; i < numSpheres; i++) {
-      rotationSpeeds.add(math.Random().nextDouble() * 3 + 0.5);
-      phaseOffsets.add(math.Random().nextDouble() * 2 * math.pi);
-    }
-  }
-
-  void _recordLatency(int durationMicroseconds) {
-    setState(() {
-      final durationMs = (durationMicroseconds / 1000).round();
-      _rawLatency.insert(0, durationMs);
-      if (_rawLatency.length > maxSamples) _rawLatency.removeLast();
-    });
-  }
-
-  // Simulate extra heavy drawing
-  void _simulateHeavyDrawing() {
-    for (int i = 0; i < 500; i++) {
-      for (int j = 0; j < 500; j++) {
-        math.sqrt(i * j * math.Random().nextDouble());
-      }
+    // sphere animation
+    sphereController =
+        AnimationController(vsync: this, duration: const Duration(seconds: 10))
+          ..repeat();
+    for (int i = 0; i < 400; i++) {
+      rotationSpeeds.add(math.Random(i).nextDouble() * 3 + 0.5);
+      phaseOffsets.add(math.Random(i + 1).nextDouble() * 2 * math.pi);
     }
   }
 
   @override
   void dispose() {
-    _animationController.dispose();
+    worker?.kill(priority: Isolate.immediate);
+    receivePort.close();
+    sphereController.dispose();
     super.dispose();
+  }
+
+  void _spawnWorker() async {
+    final ready = Completer<SendPort>();
+    final isolate = await Isolate.spawn(_workerEntry, receivePort.sendPort);
+    worker = isolate;
+    receivePort.listen((msg) {
+      if (msg is SendPort) {
+        ready.complete(msg);
+        workerPort = msg;
+      }
+    });
+    workerPort = await ready.future;
+  }
+
+  void _onPointer(PointerEvent e) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - lastTime < 16) return;
+    lastTime = now;
+
+    final sw = Stopwatch()..start();
+    setState(() {
+      points.add(e.localPosition);
+      if (points.length > maxPts) points.removeAt(0);
+    });
+
+    // CPU load scaling by number of spheres
+    final cpuLoad = numSpheres; // each sphere adds extra work
+    if (!useFastPath) {
+      _heavyWorkBlocking(cpuLoad); // baseline
+    } else {
+      final type = classifier.classify(e);
+      if (type == GestureType.heavy) {
+        // send to worker isolate
+        workerPort?.send([e.localPosition.dx, e.localPosition.dy]);
+      }
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      sw.stop();
+      final ms = sw.elapsedMilliseconds;
+      latencies.insert(0, ms);
+      if (latencies.length > 60) latencies.removeLast();
+      setState(() {});
+    });
+  }
+
+  // CPU heavy work tuned with sphere scaling
+  void _heavyWorkBlocking(int multiplier) {
+    final sw = Stopwatch()..start();
+    double acc = 0;
+    while (sw.elapsedMilliseconds < 10 + multiplier ~/ 2) {
+      for (int i = 0; i < 4000; i++) {
+        acc += math.sqrt(i * 1.2345);
+      }
+    }
+    if (acc.isNaN) debugPrint('');
+  }
+
+  int _percentile(List<int> a, double p) {
+    if (a.isEmpty) return 0;
+    final sorted = List<int>.from(a)..sort();
+    final idx = ((sorted.length - 1) * p).round();
+    return sorted[idx];
   }
 
   @override
   Widget build(BuildContext context) {
+    final sorted = [...latencies]..sort();
+    final p50 = _percentile(sorted, 0.50);
+    final p55 = _percentile(sorted, 0.55);
+    final p95 = _percentile(sorted, 0.95);
+    final p99 = _percentile(sorted, 0.99);
+
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text('RAW Baseline Latency Demo'),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
+        title: Text(useFastPath
+            ? '⚡ FAST PATH — UI + Worker'
+            : '🧱 BASELINE — Heavy on UI'),
+        actions: [
+          TextButton(
+            onPressed: () => setState(() {
+              latencies.clear();
+              useFastPath = !useFastPath;
+            }),
+            child: Text(
+              useFastPath ? 'Switch to Baseline' : 'Switch to Fast Path',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
       ),
       body: Stack(
         children: [
-          // GPU Stress Animation
+          Listener(
+            onPointerMove: _onPointer,
+            child: CustomPaint(
+              painter: DrawPainter(points),
+              child: Container(color: Colors.transparent),
+            ),
+          ),
+
+          // ---------------- 3D spheres overlay ----------------
           Positioned(
-            top: 50,
-            right: 50,
+            top: 40,
+            right: 20,
             child: SizedBox(
-              width: 350,
-              height: 350,
-              child: Extreme3DAnimation(
-                controller: _animationController,
-                numSpheres: numSpheres,
-                rotationSpeeds: rotationSpeeds,
-                phaseOffsets: phaseOffsets,
+              width: 300,
+              height: 300,
+              child: AnimatedBuilder(
+                animation: sphereController,
+                builder: (context, child) {
+                  return Stack(
+                    alignment: Alignment.center,
+                    children: List.generate(numSpheres, (i) {
+                      final rs = rotationSpeeds[i % rotationSpeeds.length];
+                      final ph = phaseOffsets[i % phaseOffsets.length];
+                      double angle =
+                          sphereController.value * 2 * math.pi * rs + ph;
+                      double radius = 20 + i % 20 * 8;
+                      double dx = radius * math.cos(angle);
+                      double dy = radius * math.sin(angle);
+                      double size = 15 + (i % 5) * 8;
+                      return Transform.translate(
+                        offset: Offset(dx, dy),
+                        child: Container(
+                          width: size,
+                          height: size,
+                          decoration: BoxDecoration(
+                            color: Colors.primaries[i % Colors.primaries.length]
+                                .withOpacity(0.5),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                      );
+                    }),
+                  );
+                },
               ),
             ),
           ),
 
-          // Drawing Layer
-          GestureDetector(
-            onPanUpdate: (details) {
-              int now = DateTime.now().millisecondsSinceEpoch;
-              if (now - _lastUpdateTime < 16) return; // ~60fps
-              _lastUpdateTime = now;
-
-              final stopwatch = Stopwatch()..start();
-
-              RenderBox renderBox = context.findRenderObject() as RenderBox;
-              final point = renderBox.globalToLocal(details.globalPosition);
-
-              setState(() {
-                _points.add(point);
-                if (_points.length > 50) _points.removeAt(0);
-              });
-
-              // Simulate heavy drawing in baseline
-              _simulateHeavyDrawing();
-
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                stopwatch.stop();
-                _recordLatency(stopwatch.elapsedMicroseconds);
-              });
-            },
-            child: RepaintBoundary(
-              child: CustomPaint(
-                painter: ExtremeDrawingPainter(_points),
-                child: Container(color: Colors.transparent),
-              ),
+          // ---------------- spheres slider ----------------
+          Positioned(
+            top: 350,
+            left: 20,
+            right: 20,
+            child: Column(
+              children: [
+                Text('Number of spheres: $numSpheres',
+                    style: const TextStyle(color: Colors.white)),
+                Slider(
+                  value: numSpheres.toDouble(),
+                  min: 0,
+                  max: 400,
+                  divisions: 40,
+                  onChanged: (v) => setState(() => numSpheres = v.round()),
+                  activeColor: Colors.blueAccent,
+                  inactiveColor: Colors.white24,
+                ),
+              ],
             ),
           ),
 
-          // Latency Display
           Positioned(
             bottom: 20,
             left: 20,
             child: Container(
               padding: const EdgeInsets.all(12),
+              width: 340,
               decoration: BoxDecoration(
-                color: Colors.grey.withOpacity(0.2),
+                color: Colors.white10,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Latency (ms):',
-                    style: TextStyle(
-                        color: Colors.white, fontWeight: FontWeight.bold),
-                  ),
-                  ..._rawLatency.map((ms) => Text(
-                        '${ms.toString().padLeft(3)} ms',
-                        style: const TextStyle(
-                            color: Colors.redAccent, fontFamily: 'monospace'),
-                      )),
-                ],
+              child: DefaultTextStyle(
+                style: const TextStyle(fontFamily: 'monospace'),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                        'Latency p50/p55/p95/p99: $p50 / $p55 / $p95 / $p99 ms'),
+                    const SizedBox(height: 6),
+                    Text('Last samples: ${latencies.take(15).join(', ')}'),
+                    const SizedBox(height: 10),
+                    ElevatedButton(
+                      onPressed: () => setState(() => latencies.clear()),
+                      child: const Text('Clear Samples'),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -175,85 +252,63 @@ class _StressTestPageState extends State<StressTestPage>
   }
 }
 
-// ---------------- Extreme 3D Animation ----------------
-class Extreme3DAnimation extends StatelessWidget {
-  final AnimationController controller;
-  final int numSpheres;
-  final List<double> rotationSpeeds;
-  final List<double> phaseOffsets;
+// ---------------- FastClassifier ----------------
+enum GestureType { light, heavy }
 
-  const Extreme3DAnimation({
-    required this.controller,
-    required this.numSpheres,
-    required this.rotationSpeeds,
-    required this.phaseOffsets,
-    super.key,
-  });
+class FastClassifier {
+  Offset? lastPos;
+  int lastTime = 0;
 
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: controller,
-      builder: (context, child) {
-        return Transform(
-          alignment: Alignment.center,
-          transform: Matrix4.identity()..setEntry(3, 2, 0.003),
-          child: Stack(
-            alignment: Alignment.center,
-            children: List.generate(numSpheres, (i) {
-              double angle =
-                  controller.value * 2 * math.pi * rotationSpeeds[i] +
-                      phaseOffsets[i];
-              double radius = 20 + i % 20 * 8;
-              double dx = radius * math.cos(angle);
-              double dy = radius * math.sin(angle);
-              double size = 15 + (i % 5) * 8;
-              return Transform.translate(
-                offset: Offset(dx, dy),
-                child: Container(
-                  width: size,
-                  height: size,
-                  decoration: BoxDecoration(
-                    color: Colors.primaries[i % Colors.primaries.length]
-                        .withOpacity(0.4),
-                    shape: BoxShape.circle,
-                  ),
-                ),
-              );
-            }),
-          ),
-        );
-      },
-    );
+  GestureType classify(PointerEvent e) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final dt = (now - lastTime).clamp(1, 1000);
+    lastTime = now;
+
+    if (lastPos == null) {
+      lastPos = e.localPosition;
+      return GestureType.light;
+    }
+
+    final dx = (e.localPosition - lastPos!).distance;
+    lastPos = e.localPosition;
+
+    final velocity = dx / dt;
+    final isHeavy = velocity < 0.05 || dx > 40;
+    return isHeavy ? GestureType.heavy : GestureType.light;
   }
 }
 
-// ---------------- Extreme Drawing Painter ----------------
-class ExtremeDrawingPainter extends CustomPainter {
-  final List<Offset> points;
-  ExtremeDrawingPainter(this.points);
+// ---------------- Worker isolate ----------------
+void _workerEntry(SendPort sendPort) {
+  final port = ReceivePort();
+  sendPort.send(port.sendPort);
+  port.listen((msg) {
+    final dx = msg[0] as double;
+    final dy = msg[1] as double;
+    // simulate heavy compute
+    double acc = 0;
+    for (int k = 0; k < 600000; k++) {
+      acc += math.sqrt(k + dx + dy);
+    }
+    sendPort.send(acc);
+  });
+}
 
+// ---------------- Painter ----------------
+class DrawPainter extends CustomPainter {
+  final List<Offset> pts;
+  DrawPainter(this.pts);
   @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..strokeCap = StrokeCap.round
-      ..strokeWidth = 2.5;
-
-    for (int i = 0; i < points.length - 1; i++) {
-      if (points[i] != Offset.zero && points[i + 1] != Offset.zero) {
-        for (int j = 0; j < 20; j++) {
-          final offset1 = points[i] +
-              Offset(math.sin(i * 0.1 + j) * 10, math.cos(i * 0.1 + j) * 10);
-          final offset2 = points[i + 1] +
-              Offset(math.sin(i * 0.1 + j) * 10, math.cos(i * 0.1 + j) * 10);
-          paint.color =
-              Colors.primaries[j % Colors.primaries.length].withOpacity(0.4);
-          canvas.drawLine(offset1, offset2, paint);
-        }
-      }
+  void paint(Canvas c, Size s) {
+    final p = Paint()
+      ..color = Colors.blueAccent.withOpacity(0.5)
+      ..strokeWidth = 3
+      ..strokeCap = StrokeCap.round;
+    for (int i = 1; i < pts.length; i++) {
+      c.drawLine(pts[i - 1], pts[i], p);
     }
   }
 
   @override
-  bool shouldRepaint(ExtremeDrawingPainter oldDelegate) => true;
+  bool shouldRepaint(covariant DrawPainter oldDelegate) => true;
 }
