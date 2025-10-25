@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "plyconfig.json": "jsonc"
+    },
+    "cmake.sourceDirectory": "C:/Users/kusumita/Downloads/drawing/linux",
+    "java.compile.nullAnalysis.mode": "automatic"
+}
