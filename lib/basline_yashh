@@ -1,0 +1,1683 @@
+// // lib/main.dart
+// import 'dart:async';
+// import 'dart:developer' as developer;
+// import 'dart:isolate';
+// import 'dart:io';
+// import 'dart:math' as math;
+// import 'package:flutter/material.dart';
+// import 'package:path_provider/path_provider.dart';
+
+// void main() {
+//   WidgetsFlutterBinding.ensureInitialized();
+//   runApp(const FlutterPulseApp());
+// }
+
+// // -------------------- App --------------------
+
+// class FlutterPulseApp extends StatelessWidget {
+//   const FlutterPulseApp({super.key});
+
+//   @override
+//   Widget build(BuildContext context) {
+//     return MaterialApp(
+//       title: 'FlutterPulse — Phase1 (FastPath + Workers)',
+//       theme: ThemeData.dark(),
+//       home: const StressTestPage(),
+//       debugShowCheckedModeBanner: false,
+//     );
+//   }
+// }
+
+// // -------------------- Fast Classifier --------------------
+
+// class FastClassifier {
+//   bool isFastGesture({
+//     required int activePointers,
+//     required String detail,
+//     required double computeIntensity,
+//   }) {
+//     if (activePointers > 1) return false;
+//     if (computeIntensity > 0.75) return false;
+//     if (detail == 'down' || detail == 'up') return true;
+//     if (detail == 'move') return true;
+//     return true;
+//   }
+// }
+
+// // -------------------- Worker Isolate --------------------
+
+// class WorkerIsolate {
+//   Isolate? _isolate;
+//   SendPort? _sendPort;
+//   final ReceivePort _receivePort = ReceivePort();
+//   Function(int seq, Map<String, dynamic> result)? onResult;
+
+//   int maxOutstanding;
+//   int sampleRate;
+//   int _outstanding = 0;
+//   int coalesceWindowMs;
+
+//   WorkerIsolate({
+//     this.maxOutstanding = 8,
+//     this.sampleRate = 1,
+//     this.coalesceWindowMs = 20,
+//   });
+
+//   Future<void> spawn({required String name, int workMultiplier = 1}) async {
+//     final ready = Completer<void>();
+//     final spawnPort = ReceivePort();
+
+//     late StreamSubscription sub;
+//     sub = spawnPort.listen((msg) {
+//       if (msg is SendPort) {
+//         _sendPort = msg;
+//         ready.complete();
+//         sub.cancel();
+//       }
+//     });
+
+//     _isolate = await Isolate.spawn(_workerEntry, spawnPort.sendPort, debugName: name);
+
+//     _receivePort.listen((msg) {
+//       if (msg is Map && msg['type'] == 'result') {
+//         final seq = msg['seq'] as int;
+//         final result = Map<String, dynamic>.from(msg['result'] ?? {});
+//         if (_outstanding > 0) _outstanding--;
+//         onResult?.call(seq, result);
+//       }
+//     });
+
+//     await ready.future;
+//     _sendPort?.send({
+//       'type': 'register',
+//       'reply': _receivePort.sendPort,
+//       'multiplier': workMultiplier
+//     });
+//   }
+
+//   void sendEvent(int seq, Map<String, dynamic> payload) {
+//     if (_sendPort == null) {
+//       developer.postEvent('worker_send_failed', {'seq': seq, 'reason': 'no_send_port'});
+//       return;
+//     }
+
+//     // sampling
+//     if (sampleRate > 1 && (seq % sampleRate != 0)) {
+//       developer.postEvent('worker_sampled_out', {'seq': seq});
+//       return;
+//     }
+
+//     // coalescing by pointerId if provided (optional)
+//     if (payload.containsKey('pointerId')) {
+//       // simplistic coalescing not implemented here; placeholder
+//     }
+
+//     if (_outstanding >= maxOutstanding) {
+//       developer.postEvent('worker_dropped', {'seq': seq, 'outstanding': _outstanding});
+//       return;
+//     }
+
+//     _outstanding++;
+//     _sendPort?.send({'type': 'event', 'seq': seq, 'payload': payload});
+//     developer.postEvent('worker_sent', {'seq': seq, 'outstanding': _outstanding});
+//   }
+
+//   int outstanding() => _outstanding;
+
+//   void kill() {
+//     try {
+//       _isolate?.kill(priority: Isolate.immediate);
+//     } finally {
+//       try {
+//         _receivePort.close();
+//       } catch (_) {}
+//       _isolate = null;
+//       _sendPort = null;
+//     }
+//   }
+
+//   static void _workerEntry(SendPort mainReply) {
+//     final workerReceive = ReceivePort();
+//     mainReply.send(workerReceive.sendPort);
+//     SendPort? uiPort;
+//     int multiplier = 1;
+
+//     workerReceive.listen((msg) {
+//       if (msg is Map) {
+//         if (msg['type'] == 'register') {
+//           uiPort = msg['reply'] as SendPort?;
+//           multiplier = msg['multiplier'] as int? ?? 1;
+//         } else if (msg['type'] == 'event') {
+//           final seq = msg['seq'] as int;
+//           final payload = Map<String, dynamic>.from(msg['payload'] ?? {});
+//           final sentTsStr = payload['sent_ts'] as String?;
+//           DateTime? sentTs = sentTsStr != null ? DateTime.parse(sentTsStr) : null;
+//           final start = DateTime.now();
+
+//           // Simulate heavy compute proportional to multiplier
+//           int acc = 0;
+//           final count = 250000 * multiplier;
+//           for (int i = 0; i < count; i++) {
+//             acc ^= (i * 37) % 1234567;
+//           }
+
+//           final end = DateTime.now();
+//           final workMs = end.difference(start).inMilliseconds;
+//           final queuedMs = sentTs != null ? start.difference(sentTs).inMilliseconds : -1;
+
+//           uiPort?.send({
+//             'type': 'result',
+//             'seq': seq,
+//             'result': {
+//               'work_ms': workMs,
+//               'queued_ms': queuedMs,
+//               'acc': acc,
+//               'worker': 'iso-$multiplier',
+//               'worker_ts': end.toIso8601String(),
+//             }
+//           });
+//         }
+//       }
+//     }, onError: (e, st) {
+//       mainReply.send({'type': 'worker_error', 'error': e.toString()});
+//     });
+//   }
+// }
+
+// // -------------------- Profiler --------------------
+
+// class EventProfiler {
+//   int _seq = 0;
+//   final Map<int, DateTime> _pending = {};
+//   final List<_Sample> samples = [];
+//   final int maxSamples = 20000;
+
+//   int recordInputEvent({String detail = ''}) {
+//     final id = ++_seq;
+//     _pending[id] = DateTime.now();
+//     developer.postEvent('input_event', {'seq': id, 'detail': detail});
+//     return id;
+//   }
+
+//   void onFramePainted() {
+//     final now = DateTime.now();
+//     final keys = _pending.keys.toList();
+//     for (final k in keys) {
+//       final start = _pending.remove(k);
+//       if (start != null) {
+//         final latencyMs = now.difference(start).inMilliseconds;
+//         samples.add(_Sample(seq: k, latencyMs: latencyMs, ts: start));
+//         developer.postEvent('input_painted', {'seq': k, 'latency_ms': latencyMs});
+//       }
+//     }
+//     if (samples.length > maxSamples) {
+//       samples.removeRange(0, samples.length - maxSamples);
+//     }
+//   }
+
+//   Map<String, int> computePercentiles({int window = 1000}) {
+//     if (samples.isEmpty) return {'p50': 0, 'p95': 0, 'p99': 0};
+//     final use = samples.length < window
+//         ? samples.map((s) => s.latencyMs).toList()
+//         : samples.sublist(samples.length - window).map((s) => s.latencyMs).toList();
+//     use.sort();
+//     int at(double p) {
+//       final idx = ((use.length - 1) * p).floor();
+//       return use[math.max(0, math.min(use.length - 1, idx))];
+//     }
+
+//     return {'p50': at(0.50), 'p95': at(0.95), 'p99': at(0.99)};
+//   }
+
+//   Future<String> exportCsv(List<Map<String, dynamic>> workerRows) async {
+//     final dir = await getApplicationDocumentsDirectory();
+//     final file = File('${dir.path}/flutterpulse_phase1_${DateTime.now().millisecondsSinceEpoch}.csv');
+//     final sink = file.openWrite();
+//     sink.writeln('seq,ts,latency_ms,worker,queued_ms,work_ms');
+//     for (final s in samples) {
+//       final matching = workerRows.firstWhere((r) => r['seq'] == s.seq, orElse: () => {});
+//       final worker = matching['worker'] ?? '';
+//       final queued = matching['queued_ms'] ?? '';
+//       final work = matching['work_ms'] ?? '';
+//       sink.writeln('${s.seq},${s.ts.toIso8601String()},${s.latencyMs},$worker,$queued,$work');
+//     }
+//     await sink.flush();
+//     await sink.close();
+//     developer.postEvent('export_csv', {'path': file.path});
+//     return file.path;
+//   }
+// }
+
+// class _Sample {
+//   final int seq;
+//   final DateTime ts;
+//   final int latencyMs;
+//   _Sample({required this.seq, required this.ts, required this.latencyMs});
+// }
+
+// // -------------------- CPU heavy helper --------------------
+
+// class CpuHeavy {
+//   static int doHeavyWork(int tris, {int multiplier = 1}) {
+//     final rnd = math.Random(54321);
+//     double acc = 0.0;
+//     final loops = (tris * multiplier).clamp(1000, 100000000);
+//     for (int t = 0; t < loops; t++) {
+//       acc += rnd.nextDouble() * (t % 7 + 1);
+//     }
+//     return acc.toInt();
+//   }
+// }
+
+// // -------------------- Main Page --------------------
+
+// class StressTestPage extends StatefulWidget {
+//   const StressTestPage({super.key});
+
+//   @override
+//   State<StressTestPage> createState() => _StressTestPageState();
+// }
+
+// class _StressTestPageState extends State<StressTestPage> with SingleTickerProviderStateMixin {
+//   final EventProfiler profiler = EventProfiler();
+//   final FastClassifier classifier = FastClassifier();
+
+//   final List<Offset> _points = [];
+//   late AnimationController _animationController;
+
+//   // control state
+//   double _graphicsSliderValue = 0.5;
+//   double _computeIntensity = 0.5;
+//   bool _enableHeavyDraw = true;
+//   bool _busyBlockEnabled = false;
+//   int _busyBlockMs = 40;
+//   bool _busyBlockPerFrame = false;
+
+//   bool _useOffload = false;
+//   bool _useTwoWorkers = false;
+
+//   int _numSpheres = 200;
+//   List<double> rotationSpeeds = [];
+//   List<double> phaseOffsets = [];
+
+//   WorkerIsolate? workerHeavy;
+//   WorkerIsolate? workerVeryHeavy;
+//   List<Map<String, dynamic>> workerResults = [];
+
+//   int heavyDone = 0;
+//   int veryHeavyDone = 0;
+
+//   final List<int> _rawLatency = [];
+//   static const int maxSamples = 12;
+
+//   int _lastUpdateTime = 0;
+
+//   @override
+//   void initState() {
+//     super.initState();
+//     _animationController = AnimationController(vsync: this, duration: const Duration(seconds: 10))..repeat();
+//     _applyGraphicsAndComputeSettings();
+
+//     _animationController.addListener(() {
+//       if (_busyBlockPerFrame) _blockUiFor(_busyBlockMs);
+//     });
+//   }
+
+//   @override
+//   void dispose() {
+//     _animationController.dispose();
+//     workerHeavy?.kill();
+//     workerVeryHeavy?.kill();
+//     super.dispose();
+//   }
+
+//   void _applyGraphicsAndComputeSettings() {
+//     final minSpheres = 20;
+//     final maxSpheres = 1200;
+//     _numSpheres = (minSpheres + (_graphicsSliderValue * (maxSpheres - minSpheres))).round();
+//     final rnd = math.Random(42);
+//     rotationSpeeds = List<double>.generate(_numSpheres, (_) => rnd.nextDouble() * 3 + 0.5);
+//     phaseOffsets = List<double>.generate(_numSpheres, (_) => rnd.nextDouble() * 2 * math.pi);
+//   }
+
+//   void _recordLatency(int micros) {
+//     setState(() {
+//       _rawLatency.insert(0, (micros / 1000).round());
+//       if (_rawLatency.length > maxSamples) _rawLatency.removeLast();
+//     });
+//   }
+
+//   void _blockUiFor(int ms) {
+//     final sw = Stopwatch()..start();
+//     var x = 0.0;
+//     while (sw.elapsedMilliseconds < ms) {
+//       x += math.sqrt((sw.elapsedMilliseconds + 1) * 1.0001);
+//       if (x > 1e12) x = 0.0;
+//     }
+//     sw.stop();
+//   }
+
+//   void _simulateHeavyDrawing() {
+//     if (!_enableHeavyDraw) return;
+//     final rnd = math.Random(1337);
+//     final intensityFactor = (_computeIntensity * 18.0) + 1.0;
+//     final outer = (40 * intensityFactor).round();
+//     final inner = (200 * intensityFactor).round();
+//     var acc = 0.0;
+//     for (int i = 0; i < outer; i++) {
+//       final base = (i + 1).toDouble();
+//       for (int j = 0; j < inner; j++) {
+//         final val = (base * (j + 1) + rnd.nextDouble());
+//         acc += math.sqrt(val) * math.sin(val) * math.cos(val * 0.0001);
+//       }
+//     }
+//     if (acc.isInfinite) {}
+//   }
+
+//   Future<void> _ensureWorkersSpawned() async {
+//     if (workerHeavy == null) {
+//       workerHeavy = WorkerIsolate(maxOutstanding: 8);
+//       workerHeavy!.onResult = _onWorkerResult;
+//       await workerHeavy!.spawn(name: 'worker-heavy', workMultiplier: 1);
+//       developer.postEvent('worker_spawned', {'name': 'heavy'});
+//     }
+//     if (_useTwoWorkers && workerVeryHeavy == null) {
+//       workerVeryHeavy = WorkerIsolate(maxOutstanding: 8);
+//       workerVeryHeavy!.onResult = _onWorkerResult;
+//       await workerVeryHeavy!.spawn(name: 'worker-very-heavy', workMultiplier: 4);
+//       developer.postEvent('worker_spawned', {'name': 'very-heavy'});
+//     }
+//   }
+
+//   void _onWorkerResult(int seq, Map<String, dynamic> res) {
+//     workerResults.add({
+//       'seq': seq,
+//       'worker': res['worker'],
+//       'queued_ms': res['queued_ms'],
+//       'work_ms': res['work_ms'],
+//     });
+//     setState(() {
+//       if ((res['worker'] ?? '').toString().contains('4')) veryHeavyDone++;
+//       else heavyDone++;
+//     });
+//     developer.postEvent('worker_result', res);
+//   }
+
+//   Future<void> _routeEvent(int seq, String detail, Offset pos) async {
+//     final isFast = classifier.isFastGesture(activePointers: 1, detail: detail, computeIntensity: _computeIntensity);
+
+//     if (isFast) {
+//       // fast path - immediate cheap work
+//       developer.postEvent('fast_path', {'seq': seq});
+//       // still simulate some UI painting work
+//       _simulateHeavyDrawing(); // optional: remove if you want pure fast path
+//       return;
+//     }
+
+//     // heavy path
+//     if (!_useOffload) {
+//       // run on UI thread (blocks) to show baseline
+//       final start = DateTime.now();
+//       CpuHeavy.doHeavyWork((_computeIntensity * 50000).round() + 1000);
+//       final end = DateTime.now();
+//       developer.postEvent('heavy_on_ui', {'seq': seq, 'ms': end.difference(start).inMilliseconds});
+//       return;
+//     }
+
+//     // offload
+//     await _ensureWorkersSpawned();
+//     final payload = {
+//       'type': detail,
+//       'x': pos.dx,
+//       'y': pos.dy,
+//       'sent_ts': DateTime.now().toIso8601String(),
+//     };
+
+//     final chooseVery = _computeIntensity > 0.85;
+//     if (_useTwoWorkers && chooseVery && workerVeryHeavy != null) {
+//       workerVeryHeavy!.sendEvent(seq, payload);
+//     } else {
+//       workerHeavy!.sendEvent(seq, payload);
+//     }
+//   }
+
+//   Future<void> _exportCsv() async {
+//     final path = await profiler.exportCsv(workerResults);
+//     if (!mounted) return;
+//     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Exported CSV: $path')));
+//   }
+
+//   @override
+//   Widget build(BuildContext context) {
+//     _applyGraphicsAndComputeSettings();
+//     final stats = profiler.computePercentiles(window: 1000);
+
+//     return Scaffold(
+//       appBar: AppBar(
+//         title: const Text('FlutterPulse — Phase1 (FastPath + 2 Workers)'),
+//         actions: [
+//           TextButton(onPressed: _exportCsv, child: const Text('Export CSV')),
+//         ],
+//       ),
+//       body: Stack(
+//         children: [
+//           // heavy 3D animation (decorative but heavy)
+//           Positioned(top: 40, right: 40, child: SizedBox(width: 420, height: 420, child: Extreme3DAnimation(controller: _animationController, numSpheres: _numSpheres, rotationSpeeds: rotationSpeeds, phaseOffsets: phaseOffsets, heavyDraw: _enableHeavyDraw))),
+//           // drawing area
+//           Positioned.fill(
+//             child: Listener(
+//               onPointerDown: (e) {
+//                 final seq = profiler.recordInputEvent(detail: 'down');
+//                 final box = context.findRenderObject() as RenderBox;
+//                 final pos = box.globalToLocal(e.position);
+//                 _routeEvent(seq, 'down', pos);
+//               },
+//               onPointerMove: (e) {
+//                 final now = DateTime.now().millisecondsSinceEpoch;
+//                 if (now - _lastUpdateTime < 12) return;
+//                 _lastUpdateTime = now;
+
+//                 final seq = profiler.recordInputEvent(detail: 'move');
+//                 final box = context.findRenderObject() as RenderBox;
+//                 final pos = box.globalToLocal(e.position);
+
+//                 setState(() {
+//                   _points.add(pos);
+//                   if (_points.length > 120) _points.removeAt(0);
+//                 });
+
+//                 if (_busyBlockEnabled) _blockUiFor(_busyBlockMs);
+
+//                 _simulateHeavyDrawing();
+//                 _routeEvent(seq, 'move', pos);
+
+//                 WidgetsBinding.instance.addPostFrameCallback((_) {
+//                   profiler.onFramePainted(); // close pending events
+//                 });
+//               },
+//               child: CustomPaint(painter: ExtremeDrawingPainter(_points, heavyPaint: _enableHeavyDraw), child: Container(color: Colors.transparent)),
+//             ),
+//           ),
+
+//           // controls panel
+//           Positioned(left: 20, top: 20, child: Container(width: 420, padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Colors.black.withOpacity(0.35), borderRadius: BorderRadius.circular(12)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+//             const Text('Controls', style: TextStyle(fontWeight: FontWeight.bold)),
+//             const SizedBox(height: 6),
+//             Row(children: [
+//               const Text('Offload'),
+//               Switch(value: _useOffload, onChanged: (v) => setState(() => _useOffload = v)),
+//               const SizedBox(width: 12),
+//               const Text('Use 2 workers'),
+//               Switch(value: _useTwoWorkers, onChanged: (v) => setState(() => _useTwoWorkers = v)),
+//             ]),
+//             const SizedBox(height: 6),
+//             Text('Compute intensity: ${(_computeIntensity * 100).round()}%'),
+//             Slider(value: _computeIntensity, onChanged: (v) => setState(() => _computeIntensity = v)),
+//             const SizedBox(height: 6),
+//             Row(children: [
+//               const Text('Enable heavy draw'),
+//               Switch(value: _enableHeavyDraw, onChanged: (v) => setState(() => _enableHeavyDraw = v)),
+//               const SizedBox(width: 12),
+//               ElevatedButton(onPressed: () => setState(() => _applyGraphicsAndComputeSettings()), child: const Text('Regen Spheres')),
+//             ]),
+//             const Divider(),
+//             Row(children: [
+//               const Text('Busy block on pointer'),
+//               Switch(value: _busyBlockEnabled, onChanged: (v) => setState(() => _busyBlockEnabled = v)),
+//               const SizedBox(width: 8),
+//               const Text('ms:'),
+//               const SizedBox(width: 6),
+//               SizedBox(width: 70, child: TextFormField(initialValue: _busyBlockMs.toString(), keyboardType: TextInputType.number, onFieldSubmitted: (s) {
+//                 final val = int.tryParse(s);
+//                 if (val != null && val >= 0 && val <= 1000) setState(() => _busyBlockMs = val);
+//               }, decoration: const InputDecoration(isDense: true, contentPadding: EdgeInsets.symmetric(vertical: 8, horizontal: 8)))),
+//             ]),
+//             Row(children: [
+//               const Text('Busy block per-frame'),
+//               Switch(value: _busyBlockPerFrame, onChanged: (v) => setState(() {
+//                 _busyBlockPerFrame = v;
+//                 if (v) _animationController.addListener(() { if (_busyBlockPerFrame) _blockUiFor(_busyBlockMs); });
+//                 else _animationController.removeListener(() {});
+//               })),
+//               const Spacer(),
+//               ElevatedButton(onPressed: () { _blockUiFor(150); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Blocked UI for 150ms'))); }, child: const Text('Block 150ms')),
+//             ]),
+//             const SizedBox(height: 6),
+//             Text('p50: ${stats['p50']} ms  p95: ${stats['p95']} ms  p99: ${stats['p99']} ms'),
+//             Text('worker results: heavy=$heavyDone  very-heavy=$veryHeavyDone'),
+//           ]))),
+//           // latency panel
+//           Positioned(bottom: 20, left: 20, child: Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: Colors.black.withOpacity(0.4), borderRadius: BorderRadius.circular(8)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+//             const Text('Recent latencies (ms):', style: TextStyle(fontWeight: FontWeight.bold)),
+//             const SizedBox(height: 6),
+//             ..._rawLatency.map((ms) => Text('$ms ms', style: const TextStyle(color: Colors.redAccent))),
+//           ]))),
+//         ],
+//       ),
+//     );
+//   }
+// }
+
+// // -------------------- Extreme3DAnimation --------------------
+
+// class Extreme3DAnimation extends StatelessWidget {
+//   final AnimationController controller;
+//   final int numSpheres;
+//   final List<double> rotationSpeeds;
+//   final List<double> phaseOffsets;
+//   final bool heavyDraw;
+
+//   const Extreme3DAnimation({
+//     super.key,
+//     required this.controller,
+//     required this.numSpheres,
+//     required this.rotationSpeeds,
+//     required this.phaseOffsets,
+//     this.heavyDraw = true,
+//   });
+
+//   @override
+//   Widget build(BuildContext context) {
+//     return AnimatedBuilder(animation: controller, builder: (context, child) {
+//       return Stack(alignment: Alignment.center, children: List.generate(numSpheres, (i) {
+//         final speed = rotationSpeeds.length > i ? rotationSpeeds[i] : 1.0;
+//         final phase = phaseOffsets.length > i ? phaseOffsets[i] : 0.0;
+//         final angle = controller.value * 2 * math.pi * speed + phase;
+//         final radius = 20 + (i % 80) * 6;
+//         final dx = radius * math.cos(angle) * 0.55;
+//         final dy = radius * math.sin(angle) * 0.55;
+//         final color = Colors.primaries[i % Colors.primaries.length].withOpacity(heavyDraw ? 0.35 : 0.12);
+//         return Positioned(left: 190 + dx, top: 190 + dy, child: Container(width: 6 + (i % 8) * 2, height: 6 + (i % 8) * 2, decoration: BoxDecoration(color: color, shape: BoxShape.circle)));
+//       }));
+//     });
+//   }
+// }
+
+// // -------------------- ExtremeDrawingPainter --------------------
+
+// class ExtremeDrawingPainter extends CustomPainter {
+//   final List<Offset> points;
+//   final bool heavyPaint;
+//   ExtremeDrawingPainter(this.points, {this.heavyPaint = true});
+
+//   @override
+//   void paint(Canvas canvas, Size size) {
+//     final paint = Paint()..strokeCap = StrokeCap.round..strokeWidth = 2.5;
+
+//     for (int i = 0; i < points.length - 1; i++) {
+//       final p1 = points[i];
+//       final p2 = points[i + 1];
+//       if (p1 == Offset.zero || p2 == Offset.zero) continue;
+//       for (int j = 0; j < (heavyPaint ? 40 : 8); j++) {
+//         paint.color = Colors.primaries[j % Colors.primaries.length].withOpacity(heavyPaint ? 0.25 : 0.45);
+//         final off1 = p1 + Offset(math.sin(i * 0.1 + j) * 6, math.cos(i * 0.1 + j) * 6);
+//         final off2 = p2 + Offset(math.sin(i * 0.1 + j) * 6, math.cos(i * 0.1 + j) * 6);
+//         canvas.drawLine(off1, off2, paint);
+//       }
+//     }
+
+//     if (heavyPaint) {
+//       final rnd = math.Random(99);
+//       final count = 150 + (size.shortestSide ~/ 2);
+//       for (int k = 0; k < count; k++) {
+//         final cx = rnd.nextDouble() * size.width;
+//         final cy = rnd.nextDouble() * size.height;
+//         final r = 1.0 + rnd.nextDouble() * 12.0;
+//         paint.style = PaintingStyle.stroke;
+//         paint.strokeWidth = (1 + (k % 3)).toDouble();
+//         paint.color = Colors.primaries[k % Colors.primaries.length].withOpacity(0.08);
+//         canvas.drawCircle(Offset(cx, cy), r, paint);
+//       }
+//     }
+//   }
+
+//   @override
+//   bool shouldRepaint(covariant ExtremeDrawingPainter oldDelegate) => true;
+// }
+
+
+// lib/main.dart
+import 'dart:async';
+import 'dart:collection';
+import 'dart:isolate';
+import 'dart:convert';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const MyApp());
+}
+
+// ---------------- Main App ----------------
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'FAST PATH Latency Demo',
+      theme: ThemeData.dark(),
+      home: const StressTestPage(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+// ---------------- FastClassifier (UI) ----------------
+// Very cheap heuristics to run on UI thread (<1ms target).
+enum FastClassification { light, heavyMaybe, heavy }
+
+class FastClassifier {
+  final int maxLightPointerCount;
+  final double moveThreshold; // px
+  final int dwellThresholdMs; // if pointer stays still this long -> heavyMaybe
+  FastClassifier({
+    this.maxLightPointerCount = 1,
+    this.moveThreshold = 4.0,
+    this.dwellThresholdMs = 350,
+  });
+
+  // Minimal state used to make quick decision
+  final Map<int, Offset> _lastPos = {};
+  final Map<int, int> _downAt = {};
+
+  FastClassification onPointerDown(int pointer, Offset pos) {
+    _lastPos[pointer] = pos;
+    _downAt[pointer] = DateTime.now().millisecondsSinceEpoch;
+    // single-finger down -> optimistic light
+    return FastClassification.light;
+  }
+
+  FastClassification onPointerMove(int pointer, Offset pos, Offset delta, int pointersCount, double velocity) {
+    // Quick checks:
+    // - too many pointers => heavy
+    if (pointersCount > maxLightPointerCount) return FastClassification.heavy;
+
+    // - large delta or high velocity => light (fast fling) — but fast fling may be heavy; we treat as light to keep UI snappy
+    if (delta.distance > moveThreshold) {
+      // If velocity is low but long dwell -> maybe heavy
+      final downAt = _downAt[pointer] ?? 0;
+      final dwell = DateTime.now().millisecondsSinceEpoch - downAt;
+      if (dwell > dwellThresholdMs && velocity < 50.0) {
+        return FastClassification.heavyMaybe;
+      }
+      _lastPos[pointer] = pos;
+      return FastClassification.light;
+    }
+
+    // micro moves -> keep local, but if dwell exceeded treat heavyMaybe
+    final downAt = _downAt[pointer] ?? 0;
+    final dwell = DateTime.now().millisecondsSinceEpoch - downAt;
+    if (dwell > dwellThresholdMs) {
+      return FastClassification.heavyMaybe;
+    }
+    _lastPos[pointer] = pos;
+    return FastClassification.light;
+  }
+
+  FastClassification onPointerUp(int pointer) {
+    _lastPos.remove(pointer);
+    _downAt.remove(pointer);
+    return FastClassification.light;
+  }
+
+  void clearPointer(int pointer) {
+    _lastPos.remove(pointer);
+    _downAt.remove(pointer);
+  }
+}
+
+// ---------------- Outgoing message and queue management ----------------
+class GestureMessage {
+  final int gestureId;
+  final int seq;
+  final String type; // "move", "start", "end", "cancel"
+  final Map<String, dynamic> payload;
+  final bool isCoalesced;
+  final int timestamp;
+
+  GestureMessage({
+    required this.gestureId,
+    required this.seq,
+    required this.type,
+    required this.payload,
+    this.isCoalesced = false,
+  }) : timestamp = DateTime.now().millisecondsSinceEpoch;
+}
+
+class OutgoingManager {
+  final dynamic workerPort; // SendPort on native, fake on web
+
+  // global monotonically increasing sequence for this UI session
+  int _globalSeq = 0;
+
+  // gesture local seq counters (monotonic per gesture)
+  final Map<int, int> _gestureSeq = {};
+
+  // small outgoing queue with max size
+  final int maxQueueSize;
+  final Queue<GestureMessage> _queue = Queue<GestureMessage>();
+
+  // per-gesture last applied seq used by UI to drop stale results
+  final Map<int, int> lastAppliedSeqForGesture = {};
+
+  // cancellation state
+  final Map<int, String> gestureState = {}; // 'running' | 'cancelled' | 'finished'
+
+  // coalescing helpers
+  final Map<int, GestureMessage> _lastPendingPerGesture = {};
+  final Map<int, Timer?> _coalesceTimers = {};
+
+  // dynamic throttling tokens (simple token-bucket)
+  int tokens;
+  final int maxTokens;
+  Timer? _tokenRefillTimer;
+
+  OutgoingManager({
+    required this.workerPort,
+    this.maxQueueSize = 8,
+    this.maxTokens = 6,
+  }) : tokens = 6 {
+    // refill tokens periodically
+    _tokenRefillTimer = Timer.periodic(const Duration(milliseconds: 120), (_) {
+      tokens = (tokens + 1).clamp(0, maxTokens);
+      _tryFlush();
+    });
+  }
+
+  void dispose() {
+    _tokenRefillTimer?.cancel();
+    for (final t in _coalesceTimers.values) {
+      t?.cancel();
+    }
+  }
+
+  int nextGestureId() {
+    // simple integer id; could be UUID but avoids package
+    final id = DateTime.now().millisecondsSinceEpoch ^ math.Random().nextInt(1 << 16);
+    gestureState[id] = 'running';
+    _gestureSeq[id] = 0;
+    return id;
+  }
+
+  int nextSeqForGesture(int gestureId) {
+    _globalSeq++;
+    _gestureSeq[gestureId] = (_gestureSeq[gestureId] ?? 0) + 1;
+    return _globalSeq;
+  }
+
+  void markGestureCancelled(int gestureId) {
+    gestureState[gestureId] = 'cancelled';
+  }
+
+  void markGestureFinished(int gestureId) {
+    gestureState[gestureId] = 'finished';
+  }
+
+  bool _isQueueFull() => _queue.length >= maxQueueSize;
+
+  // Core send: attempts to obey token bucket & queue size limits.
+  void _enqueueOrDrop(GestureMessage msg) {
+    // If queue is full apply drop policy: drop oldest (FIFO) to keep newer events.
+    if (_isQueueFull()) {
+      // Merge policy example: if there is a previous pending for same gesture, we merge
+      GestureMessage? lastForGesture = _lastPendingPerGesture[msg.gestureId];
+      if (lastForGesture != null) {
+        // Merge by replacing the previous pending with this one (drop older)
+        _queue.remove(lastForGesture);
+        _lastPendingPerGesture[msg.gestureId] = msg;
+        _queue.addLast(msg);
+        return;
+      }
+
+      // Otherwise drop oldest
+      _queue.removeFirst();
+    }
+    _queue.addLast(msg);
+    _lastPendingPerGesture[msg.gestureId] = msg;
+
+    // try to flush immediately
+    _tryFlush();
+  }
+
+  void sendCoalesced(int gestureId, GestureMessage msg, {int coalesceMs = 12}) {
+    // Replace any pending coalesced msg for gesture; start small delay to allow coalescing
+    _coalesceTimers[gestureId]?.cancel();
+    _lastPendingPerGesture[gestureId] = msg;
+
+    _coalesceTimers[gestureId] = Timer(Duration(milliseconds: coalesceMs), () {
+      final pending = _lastPendingPerGesture.remove(gestureId);
+      if (pending != null) _enqueueOrDrop(pending);
+    });
+  }
+
+  void push(GestureMessage msg) {
+    // If gesture canceled, drop
+    if (gestureState[msg.gestureId] == 'cancelled') return;
+
+    // enforce simple token bucket: if tokens available, send; otherwise enqueue
+    if (tokens > 0 && _queue.isEmpty) {
+      tokens--;
+      _sendToWorker(msg);
+    } else {
+      // enqueue (coalescing should have been applied by caller for move)
+      _enqueueOrDrop(msg);
+    }
+  }
+
+  void _tryFlush() {
+    while (tokens > 0 && _queue.isNotEmpty) {
+      final msg = _queue.removeFirst();
+      // Remove from lastPending map if it was same
+      if (_lastPendingPerGesture[msg.gestureId] == msg) {
+        _lastPendingPerGesture.remove(msg.gestureId);
+      }
+      tokens--;
+      _sendToWorker(msg);
+    }
+  }
+
+  void _sendToWorker(GestureMessage msg) {
+    // Push to isolate worker via SendPort or fake port.
+    try {
+      workerPort.send({
+        'op': 'process',
+        'gestureId': msg.gestureId,
+        'seq': msg.seq,
+        'type': msg.type,
+        'payload': msg.payload,
+        'isCoalesced': msg.isCoalesced,
+        'timestamp': msg.timestamp,
+      });
+    } catch (e) {
+      // If workerPort isn't shaped like SendPort, try dynamic call
+      try {
+        (workerPort as dynamic).send({
+          'op': 'process',
+          'gestureId': msg.gestureId,
+          'seq': msg.seq,
+          'type': msg.type,
+          'payload': msg.payload,
+          'isCoalesced': msg.isCoalesced,
+          'timestamp': msg.timestamp,
+        });
+      } catch (_) {
+        // drop if cannot send
+      }
+    }
+  }
+
+  // called when worker replies
+  void onWorkerReply(Map reply, void Function(Map metrics) uiCallback) {
+    final int gestureId = reply['gestureId'] as int;
+    final int seq = reply['seq'] as int;
+    final bool isFinal = reply['isFinal'] as bool? ?? false;
+    final Map metrics = reply['metrics'] as Map? ?? {};
+
+    // Worker also may report 'queueDepth' or 'simLatency'
+    // Apply dynamic throttling adjustments if worker reports high latency.
+    final int? reportedQueueDepth = reply['queueDepth'] as int?;
+    final int? reportedLatencyMs = reply['latencyMs'] as int?;
+    if ((reportedLatencyMs ?? 0) > 120) {
+      // slow worker -> reduce tokens temporarily
+      tokens = (tokens - 1).clamp(0, maxTokens);
+    }
+
+    // staleness check (UI only applies if seq >= lastApplied)
+    final lastApplied = lastAppliedSeqForGesture[gestureId] ?? -1;
+    if (seq >= lastApplied && gestureState[gestureId] != 'cancelled') {
+      lastAppliedSeqForGesture[gestureId] = seq;
+      // let UI know to apply result
+      uiCallback(reply);
+    } else {
+      // drop stale result
+    }
+
+    if (isFinal) {
+      markGestureFinished(gestureId);
+      // clear any pending coalesce timer
+      _coalesceTimers[gestureId]?.cancel();
+      _coalesceTimers.remove(gestureId);
+      _lastPendingPerGesture.remove(gestureId);
+    }
+  }
+}
+
+// ---------------- Worker Isolate ----------------
+// A simple sample worker that simulates heavy recognition work.
+// Protocol: send {'op':'process', ...} to worker. Worker replies by SendPort given at initialization.
+Future<void> workerIsolateEntry(Map init) async {
+  final SendPort sendBack = init['port'];
+  final ReceivePort port = ReceivePort();
+  sendBack.send({'op': 'initAck', 'port': port.sendPort});
+
+  final Queue<Map> internalQueue = Queue<Map>();
+  bool running = true;
+
+  // actor that processes items from internalQueue
+  Future<void> processLoop() async {
+    while (running) {
+      if (internalQueue.isEmpty) {
+        // slight sleep to yield
+        await Future.delayed(const Duration(milliseconds: 8));
+        continue;
+      }
+      final item = internalQueue.removeFirst();
+      final int gestureId = item['gestureId'];
+      final int seq = item['seq'];
+      final String type = item['type'];
+      final int processStart = DateTime.now().millisecondsSinceEpoch;
+
+      // Simulate variable processing time depending on type
+      int simulatedMs = 30;
+      if (type == 'start') simulatedMs = 20;
+      if (type == 'move') simulatedMs = 18;
+      if (type == 'end') simulatedMs = 35;
+      if (item['isCoalesced'] == true) simulatedMs = (simulatedMs * 0.7).round();
+
+      // Do some CPU-ish work (busy wait small amt) to better simulate heavy compute
+      // but keep it short so demo is interactive
+      final int busyUntil = DateTime.now().millisecondsSinceEpoch + simulatedMs;
+      while (DateTime.now().millisecondsSinceEpoch < busyUntil) {
+        // cheap op
+        final v = math.sqrt(math.Random().nextDouble() + 0.0001);
+        v.isFinite;
+      }
+
+      final int latency = DateTime.now().millisecondsSinceEpoch - processStart;
+
+      // Compose reply
+      final Map reply = {
+        'gestureId': gestureId,
+        'seq': seq,
+        'result': {
+          'decision': 'ok', // placeholder
+        },
+        'metrics': {
+          'processedType': type,
+          'simulatedMs': simulatedMs,
+        },
+        'isFinal': type == 'end',
+        'queueDepth': internalQueue.length,
+        'latencyMs': latency,
+      };
+
+      // send reply
+      sendBack.send(reply);
+    }
+  }
+
+  // Start loop
+  final loopFuture = processLoop();
+
+  // Listen for incoming requests
+  await for (final raw in port) {
+    if (raw is Map && raw['op'] == 'process') {
+      // Enqueue quickly
+      internalQueue.add(raw);
+    } else if (raw == 'shutdown') {
+      running = false;
+      break;
+    }
+  }
+
+  await loopFuture;
+}
+
+// ---------------- Fake SendPort for web fallback ----------------
+class _FakeSendPort {
+  final void Function(dynamic) _onSend;
+  _FakeSendPort(this._onSend);
+  void send(dynamic msg) => _onSend(msg);
+}
+
+// ---------------- Stress Test Page (with fast path + dev controls) ----------------
+class StressTestPage extends StatefulWidget {
+  const StressTestPage({super.key});
+
+  @override
+  State<StressTestPage> createState() => _StressTestPageState();
+}
+
+class _StressTestPageState extends State<StressTestPage> with SingleTickerProviderStateMixin {
+  // drawing
+  final List<Offset> _points = [];
+  late AnimationController _animationController;
+
+  // Latency Measurement
+  final List<int> _rawLatency = [];
+  static const int maxSamples = 8;
+
+  // GPU stress spheres
+  int numSpheres = 200;
+  final List<double> rotationSpeeds = [];
+  final List<double> phaseOffsets = [];
+
+  // debounce
+  int _lastUpdateTime = 0;
+
+  // classifier + outgoing manager + isolate ports
+  final FastClassifier classifier = FastClassifier();
+  OutgoingManager? outgoingManager;
+  Isolate? workerIsolate;
+  SendPort? workerSendPort;
+  ReceivePort? uiReceivePort;
+
+  // mapping pointer -> gestureId so we can support multiple parallel gestures (multi-touch)
+  final Map<int, int> pointerToGesture = {};
+  // pointer -> last position for cheap delta
+  final Map<int, Offset> lastPointerPos = {};
+  // pointer -> last timestamp for velocity calc
+  final Map<int, int> lastPointerTime = {};
+
+  // Dev panel / telemetry variables from "improved baseline"
+  // Deterministic randomness: seeded and precomputed
+  static const int _noiseLen = 20000; // precompute size
+  final List<double> _precomputedNoise = List.filled(_noiseLen, 0.0);
+  final int _noiseSeed = 42;
+  int _noiseIdx = 0;
+
+  // Cached paint (avoid allocations during paint)
+  late final Paint _cachedPaint;
+
+  // Percentiles and frame timing
+  final List<int> _eventApplyLatenciesMs = [];
+  final List<FrameTiming> _frameTimings = [];
+
+  // CPU stress config (runtime) (these are exposed in dev panel)
+  int cpuOuter = 200;
+  int cpuInner = 200;
+
+  // coalesce / throttling tuning
+  int coalesceMs = 12;
+
+  // Synthetic generator
+  Timer? _syntheticTimer;
+  bool syntheticRunning = false;
+  int syntheticRatePerSec = 200;
+  double _syntheticAngle = 0.0;
+
+  // Telemetry counters
+  int _eventsSentToWorker = 0;
+  int _eventsDropped = 0;
+  int _coalescedBatches = 0;
+
+  // Dev panel visibility
+  bool get _devPanelVisible => !kReleaseMode;
+  bool _showDevPanel = true;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _cachedPaint = Paint()..strokeCap = StrokeCap.round..strokeWidth = 2.5;
+
+    // precompute deterministic noise values
+    final rnd = math.Random(_noiseSeed);
+    for (int i = 0; i < _noiseLen; i++) {
+      _precomputedNoise[i] = (math.sin(i * 0.01) + math.cos(i * 0.013)) *
+              (rnd.nextDouble() * 0.5 + 0.5) +
+          (i % 7) * 0.001;
+    }
+
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 10),
+    )..repeat();
+
+    for (int i = 0; i < 400; i++) {
+      rotationSpeeds.add(math.Random(_noiseSeed + i).nextDouble() * 3 + 0.5);
+      phaseOffsets.add(math.Random(_noiseSeed + i + 1).nextDouble() * 2 * math.pi);
+    }
+
+    SchedulerBinding.instance.addTimingsCallback(_onFrameTimings);
+
+    _startWorkerIsolate();
+  }
+
+  @override
+  void dispose() {
+    SchedulerBinding.instance.removeTimingsCallback(_onFrameTimings);
+    _animationController.dispose();
+    _syntheticTimer?.cancel();
+    outgoingManager?.dispose();
+    uiReceivePort?.close();
+    if (!kIsWeb && workerIsolate != null) {
+      workerSendPort?.send('shutdown');
+      workerIsolate!.kill(priority: Isolate.immediate);
+    }
+    super.dispose();
+  }
+
+  void _onFrameTimings(List<FrameTiming> timings) {
+    _frameTimings.addAll(timings);
+    while (_frameTimings.length > 200) _frameTimings.removeAt(0);
+  }
+
+  int _percentile(List<int> a, double p) {
+    if (a.isEmpty) return 0;
+    final sorted = List<int>.from(a)..sort();
+    final idx = ((sorted.length - 1) * p).floor();
+    return sorted[idx];
+  }
+
+  // Deterministic CPU stress using precomputed noise (used by synthetic baseline)
+  void _simulateDeterministicCpuWork() {
+    int idx = _noiseIdx;
+    _noiseIdx = (_noiseIdx + 37) % _noiseLen;
+
+    for (int i = 0; i < cpuOuter; i++) {
+      double acc = 0.0;
+      int localIdx = idx;
+      for (int j = 0; j < cpuInner; j++) {
+        acc += (_precomputedNoise[localIdx] * (i + 1) * (j + 1)).abs();
+        localIdx++;
+        if (localIdx >= _noiseLen) localIdx = 0;
+      }
+      if (acc.isNaN) debugPrint('unexpected NaN');
+    }
+  }
+
+  // Worker start with web fallback
+  void _startWorkerIsolate() async {
+    uiReceivePort = ReceivePort();
+    uiReceivePort!.listen(_onIsolateMessageFromWorker);
+
+    if (kIsWeb) {
+      // web fallback: fake in-thread queue + periodic processor, but same reply shape
+      final Queue<Map> fakeInternalQueue = Queue<Map>();
+
+      // fake send port used by OutgoingManager
+      final fakeSendPort = _FakeSendPort((dynamic msg) {
+        if (msg is Map && msg['op'] == 'process') {
+          fakeInternalQueue.add(msg);
+        }
+      });
+
+      // create manager with fake port
+      outgoingManager = OutgoingManager(workerPort: fakeSendPort);
+
+      // processing loop driven by a Timer (simulating worker latency)
+      Timer.periodic(const Duration(milliseconds: 8), (timer) async {
+        if (fakeInternalQueue.isEmpty) return;
+        final item = fakeInternalQueue.removeFirst();
+        final int gestureId = item['gestureId'];
+        final int seq = item['seq'];
+        final String type = item['type'];
+        int simulatedMs = 30;
+        if (type == 'start') simulatedMs = 20;
+        if (type == 'move') simulatedMs = 18;
+        if (type == 'end') simulatedMs = 35;
+        if (item['isCoalesced'] == true) simulatedMs = (simulatedMs * 0.7).round();
+
+        // simulate processing delay
+        await Future.delayed(Duration(milliseconds: simulatedMs));
+        final Map reply = {
+          'gestureId': gestureId,
+          'seq': seq,
+          'result': {'decision': 'ok'},
+          'metrics': {'processedType': type, 'simulatedMs': simulatedMs},
+          'isFinal': type == 'end',
+          'queueDepth': fakeInternalQueue.length,
+          'latencyMs': simulatedMs,
+        };
+
+        // deliver reply to UI port
+        uiReceivePort!.sendPort.send(reply);
+      });
+
+      return;
+    }
+
+    // non-web: spawn an isolate
+    workerIsolate = await Isolate.spawn<Map>(
+      workerIsolateEntry,
+      {'port': uiReceivePort!.sendPort},
+      debugName: 'gestureWorker',
+    );
+  }
+
+  void _onIsolateMessageFromWorker(dynamic message) {
+    if (message is Map && message['op'] == 'initAck') {
+      final SendPort workerPort = message['port'] as SendPort;
+      workerSendPort = workerPort;
+      outgoingManager = OutgoingManager(workerPort: workerPort);
+      return;
+    }
+
+    // Worker replies
+    if (message is Map && message.containsKey('gestureId')) {
+      outgoingManager?.onWorkerReply(message, (reply) {
+        // UI apply callback — show latency sample
+        setState(() {
+          final metrics = reply['metrics'] as Map? ?? {};
+          final latency = metrics['simulatedMs'] as int? ?? 0;
+          _rawLatency.insert(0, latency);
+          if (_rawLatency.length > maxSamples) _rawLatency.removeLast();
+        });
+      });
+    }
+  }
+
+  void _recordLatency(int durationMicroseconds) {
+    setState(() {
+      final durationMs = (durationMicroseconds / 1000).round();
+      _rawLatency.insert(0, durationMs);
+      if (_rawLatency.length > maxSamples) _rawLatency.removeLast();
+    });
+  }
+
+  // cheap velocity
+  double _cheapVelocity(int pointer, Offset pos, int nowMs) {
+    final lastPos = lastPointerPos[pointer];
+    final lastTime = lastPointerTime[pointer];
+    if (lastPos == null || lastTime == null) return 0.0;
+    final dt = (nowMs - lastTime).clamp(1, 1000);
+    final dist = (pos - lastPos).distance;
+    return dist / dt * 1000; // px / s approx
+  }
+
+  // coalesced send helper
+  void _sendToWorkerInternal(int gestureId, String type, Map<String, dynamic> payload, {bool coalesce = false}) {
+    if (outgoingManager == null) return;
+    final seq = outgoingManager!.nextSeqForGesture(gestureId);
+    final msg = GestureMessage(
+      gestureId: gestureId,
+      seq: seq,
+      type: type,
+      payload: payload,
+      isCoalesced: coalesce,
+    );
+
+    if (coalesce && type == 'move') {
+      _coalescedBatches++;
+      outgoingManager!.sendCoalesced(gestureId, msg, coalesceMs: coalesceMs);
+    } else {
+      outgoingManager!.push(msg);
+    }
+
+    _eventsSentToWorker++;
+  }
+
+  // pointer update handler (called for real pointer & synthetic)
+  void _handlePointerUpdate(Offset point, {bool synthetic = false}) {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastUpdateTime < coalesceMs) {
+      _coalescedBatches++;
+      _eventsDropped++;
+      return;
+    }
+    _lastUpdateTime = now;
+
+    // assign seq for telemetry
+    final seq = DateTime.now().millisecondsSinceEpoch ^ math.Random().nextInt(1024);
+
+    // update UI fast
+    setState(() {
+      _points.add(point);
+      if (_points.length > 120) _points.removeAt(0);
+    });
+
+    // Simulate deterministic CPU work (baseline heavy)
+    _simulateDeterministicCpuWork();
+
+    // send a coalesced sample to worker (if manager exists)
+    final gestureId = 1; // demo uses a global gesture id for synthetic baseline; for multi-pointer use mapping
+    _sendToWorkerInternal(gestureId, 'move', {'x': point.dx, 'y': point.dy}, coalesce: true);
+
+    // measure apply latency when frame drawn
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final int tFrameDrawn = DateTime.now().millisecondsSinceEpoch;
+      final int elapsedMs = tFrameDrawn - now;
+      _eventApplyLatenciesMsInsert(elapsedMs);
+      setState(() {
+        _rawLatency.insert(0, elapsedMs);
+        if (_rawLatency.length > maxSamples) _rawLatency.removeLast();
+      });
+    });
+  }
+
+  void _eventApplyLatenciesMsInsert(int ms) {
+    _eventApplyLatenciesMs.insert(0, ms);
+    if (_eventApplyLatenciesMs.length > 500) _eventApplyLatenciesMs.removeLast();
+  }
+
+  // Synthetic deterministic generator
+  void _startSyntheticGenerator() {
+    if (syntheticRunning) return;
+    syntheticRunning = true;
+    final periodMs = (1000 / syntheticRatePerSec).round();
+    _syntheticTimer = Timer.periodic(Duration(milliseconds: periodMs), (_) {
+      _syntheticAngle += 0.05;
+      final r = 120.0;
+      final cx = 200.0;
+      final cy = 400.0;
+      final px = cx + r * math.cos(_syntheticAngle);
+      final py = cy + r * math.sin(_syntheticAngle * 0.5);
+      _handlePointerUpdate(Offset(px, py), synthetic: true);
+    });
+  }
+
+  void _stopSyntheticGenerator() {
+    syntheticRunning = false;
+    _syntheticTimer?.cancel();
+    _syntheticTimer = null;
+  }
+
+  // Export JSON logs summary
+  void _exportLogs() {
+    final Map<String, dynamic> summary = {
+      'run_time': DateTime.now().toIso8601String(),
+      'config': {
+        'cpu_outer': cpuOuter,
+        'cpu_inner': cpuInner,
+        'num_spheres': numSpheres,
+        'coalesce_ms': coalesceMs,
+        'synthetic_rate_per_sec': syntheticRatePerSec,
+      },
+      'metrics': {
+        'events_sent': _eventsSentToWorker,
+        'events_dropped': _eventsDropped,
+        'coalesced_batches': _coalescedBatches,
+        'p50_ms': _percentile(_eventApplyLatenciesMs, 0.5),
+        'p95_ms': _percentile(_eventApplyLatenciesMs, 0.95),
+        'p99_ms': _percentile(_eventApplyLatenciesMs, 0.99),
+      },
+    };
+
+    final jsonOut = jsonEncode(summary);
+    debugPrint(jsonOut);
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Exported Logs'),
+        content: SingleChildScrollView(
+          child: Text('Logs exported to console (debugPrint). Summary p50/p95/p99: '
+              '${summary['metrics']['p50_ms']} / ${summary['metrics']['p95_ms']} / ${summary['metrics']['p99_ms']} ms'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('OK'))
+        ],
+      ),
+    );
+  }
+
+  void _clearTelemetry() {
+    setState(() {
+      _eventApplyLatenciesMs.clear();
+      _rawLatency.clear();
+      _frameTimings.clear();
+      _eventsSentToWorker = 0;
+      _eventsDropped = 0;
+      _coalescedBatches = 0;
+    });
+  }
+
+  // UI build
+  @override
+  Widget build(BuildContext context) {
+    final p50 = _percentile(_eventApplyLatenciesMs, 0.5);
+    final p95 = _percentile(_eventApplyLatenciesMs, 0.95);
+    final p99 = _percentile(_eventApplyLatenciesMs, 0.99);
+
+    final frameBuildAvg = _frameTimings.isEmpty ? 0 : (_frameTimings.map((t) => t.buildDuration.inMilliseconds).reduce((a, b) => a + b) / _frameTimings.length).round();
+    final frameRasterAvg = _frameTimings.isEmpty ? 0 : (_frameTimings.map((t) => t.rasterDuration.inMilliseconds).reduce((a, b) => a + b) / _frameTimings.length).round();
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('FAST PATH Latency Demo')),
+      body: Stack(children: [
+        // GPU spheres
+        Positioned(
+          top: 40,
+          right: 40,
+          child: SizedBox(
+            width: 360,
+            height: 360,
+            child: Extreme3DAnimation(
+              controller: _animationController,
+              numSpheres: numSpheres,
+              rotationSpeeds: rotationSpeeds,
+              phaseOffsets: phaseOffsets,
+            ),
+          ),
+        ),
+
+        // Drawing area using Listener
+        Listener(
+          onPointerMove: (ev) {
+            final RenderBox box = context.findRenderObject() as RenderBox;
+            _handlePointerUpdate(box.globalToLocal(ev.position));
+          },
+          child: RepaintBoundary(
+            child: CustomPaint(
+              painter: ExtremeDrawingPainter(_points, _cachedPaint, _precomputedNoise),
+              child: Container(color: Colors.transparent),
+            ),
+          ),
+        ),
+
+        // Telemetry overlay
+        Positioned(
+          bottom: 12,
+          left: 12,
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.6),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white12)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Latency p50/p95/p99: ${p50} / ${p95} / ${p99} ms', style: const TextStyle(fontFamily: 'monospace')),
+                const SizedBox(height: 6),
+                Text('Last samples: ${_rawLatency.join(', ')}', style: const TextStyle(fontFamily: 'monospace')),
+                const SizedBox(height: 6),
+                Text('Events sent/dropped/coalesced: $_eventsSentToWorker / $_eventsDropped / $_coalescedBatches', style: const TextStyle(fontFamily: 'monospace')),
+                const SizedBox(height: 6),
+                Text('Frame build/raster avg: ${frameBuildAvg} / ${frameRasterAvg} ms', style: const TextStyle(fontFamily: 'monospace')),
+                const SizedBox(height: 8),
+                Row(children: [
+                  ElevatedButton(onPressed: _clearTelemetry, child: const Text('Clear')),
+                  const SizedBox(width: 8),
+                  ElevatedButton(onPressed: _exportLogs, child: const Text('Export Log')),
+                ]),
+              ],
+            ),
+          ),
+        ),
+
+        // Dev control panel
+        if (_devPanelVisible && _showDevPanel)
+          Positioned(
+            top: 8,
+            left: 8,
+            child: SizedBox(
+              width: 360,
+              child: Card(
+                color: Colors.black54,
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Row(
+                      children: [
+                        const Text('Dev Panel', style: TextStyle(fontWeight: FontWeight.bold)),
+                        const Spacer(),
+                        IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() => _showDevPanel = false)),
+                      ],
+                    ),
+                    Row(children: [
+                      const Text('CPU outer'),
+                      Expanded(
+                        child: Slider(
+                          min: 10,
+                          max: 2000,
+                          divisions: 199,
+                          value: cpuOuter.toDouble(),
+                          onChanged: (v) => setState(() => cpuOuter = v.round()),
+                        ),
+                      ),
+                      Text('$cpuOuter'),
+                    ]),
+                    Row(children: [
+                      const Text('CPU inner'),
+                      Expanded(
+                        child: Slider(
+                          min: 10,
+                          max: 2000,
+                          divisions: 199,
+                          value: cpuInner.toDouble(),
+                          onChanged: (v) => setState(() => cpuInner = v.round()),
+                        ),
+                      ),
+                      Text('$cpuInner'),
+                    ]),
+                    Row(children: [
+                      const Text('Num spheres'),
+                      Expanded(
+                        child: Slider(
+                          min: 0,
+                          max: 400,
+                          divisions: 40,
+                          value: numSpheres.toDouble(),
+                          onChanged: (v) => setState(() => numSpheres = v.round()),
+                        ),
+                      ),
+                      Text('$numSpheres'),
+                    ]),
+                    Row(children: [
+                      const Text('Coalesce ms'),
+                      Expanded(
+                        child: Slider(
+                          min: 0,
+                          max: 50,
+                          divisions: 50,
+                          value: coalesceMs.toDouble(),
+                          onChanged: (v) => setState(() => coalesceMs = v.round()),
+                        ),
+                      ),
+                      Text('$coalesceMs ms'),
+                    ]),
+                    Row(children: [
+                      const Text('Synthetic rate'),
+                      Expanded(
+                        child: Slider(
+                          min: 10,
+                          max: 1000,
+                          divisions: 99,
+                          value: syntheticRatePerSec.toDouble(),
+                          onChanged: (v) => setState(() => syntheticRatePerSec = v.round()),
+                        ),
+                      ),
+                      Text('$syntheticRatePerSec/s'),
+                    ]),
+                    const SizedBox(height: 6),
+                    Row(children: [
+                      ElevatedButton(onPressed: syntheticRunning ? _stopSyntheticGenerator : _startSyntheticGenerator, child: Text(syntheticRunning ? 'Stop Synthetic' : 'Start Synthetic')),
+                      const SizedBox(width: 8),
+                      ElevatedButton(onPressed: () => setState(() => _points.clear()), child: const Text('Clear Points')),
+                      const SizedBox(width: 8),
+                      ElevatedButton(onPressed: () => setState(() => numSpheres = (numSpheres > 0) ? 0 : 200), child: const Text('Toggle Spheres')),
+                    ]),
+                  ]),
+                ),
+              ),
+            ),
+          ),
+      ]),
+    );
+  }
+}
+
+// ---------------- Extreme 3D Animation ----------------
+class Extreme3DAnimation extends StatelessWidget {
+  final AnimationController controller;
+  final int numSpheres;
+  final List<double> rotationSpeeds;
+  final List<double> phaseOffsets;
+
+  const Extreme3DAnimation({
+    required this.controller,
+    required this.numSpheres,
+    required this.rotationSpeeds,
+    required this.phaseOffsets,
+    super.key,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, child) {
+        return Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.identity()..setEntry(3, 2, 0.003),
+          child: Stack(
+            alignment: Alignment.center,
+            children: List.generate(numSpheres, (i) {
+              final rs = rotationSpeeds[i % rotationSpeeds.length];
+              final ph = phaseOffsets[i % phaseOffsets.length];
+              double angle = controller.value * 2 * math.pi * rs + ph;
+              double radius = 20 + i % 20 * 8;
+              double dx = radius * math.cos(angle);
+              double dy = radius * math.sin(angle);
+              double size = 15 + (i % 5) * 8;
+              return Transform.translate(
+                offset: Offset(dx, dy),
+                child: Container(
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    color: Colors.primaries[i % Colors.primaries.length].withOpacity(0.4),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              );
+            }),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ---------------- Extreme Drawing Painter ----------------
+class ExtremeDrawingPainter extends CustomPainter {
+  final List<Offset> points;
+  final Paint cachedPaint;
+  final List<double> noise;
+  ExtremeDrawingPainter(this.points, this.cachedPaint, this.noise);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = cachedPaint;
+
+    int noiseIdx = 0;
+    final int n = points.length;
+    for (int i = 0; i < n - 1; i++) {
+      final p1 = points[i];
+      final p2 = points[i + 1];
+      if (p1 != Offset.zero && p2 != Offset.zero) {
+        for (int j = 0; j < 20; j++) {
+          final dx1 = (math.sin(i * 0.1 + j) * 10) + noise[noiseIdx % noise.length] * 0.5;
+          final dy1 = (math.cos(i * 0.1 + j) * 10) + noise[(noiseIdx + 1) % noise.length] * 0.5;
+          final dx2 = (math.sin(i * 0.1 + j + 1) * 10) + noise[(noiseIdx + 2) % noise.length] * 0.5;
+          final dy2 = (math.cos(i * 0.1 + j + 1) * 10) + noise[(noiseIdx + 3) % noise.length] * 0.5;
+
+          final offset1 = p1 + Offset(dx1, dy1);
+          final offset2 = p2 + Offset(dx2, dy2);
+
+          paint.color = Colors.primaries[j % Colors.primaries.length].withOpacity(0.4);
+          canvas.drawLine(offset1, offset2, paint);
+          noiseIdx += 4;
+        }
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(ExtremeDrawingPainter oldDelegate) => true;
+}
