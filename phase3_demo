@@ -1,0 +1,230 @@
+// demo_using_core.dart
+import 'package:flutter/material.dart';
+import 'dart:math' as math;
+import 'fastpath_ui.dart'; 
+
+void main() => runApp(const MaterialApp(home: DemoPage()));
+
+class DemoPage extends StatefulWidget {
+  const DemoPage({super.key});
+  @override
+  State<DemoPage> createState() => _DemoPageState();
+}
+
+class _DemoPageState extends State<DemoPage> with SingleTickerProviderStateMixin {
+  final ctrl = FastPathController();
+  List<int> samples = [];
+  bool fast = true;
+
+  // 3D spheres state
+  late AnimationController _animationController;
+  int numSpheres = 200;
+  final List<double> rotationSpeeds = [];
+  final List<double> phaseOffsets = [];
+  List<Offset> drawPoints = [];
+
+  @override
+  void initState() {
+    super.initState();
+    ctrl.setUseFastPath(true);
+    _animationController = AnimationController(vsync: this, duration: const Duration(seconds: 10))..repeat();
+    for (int i = 0; i < 400; i++) {
+      rotationSpeeds.add(math.Random(42 + i).nextDouble() * 3 + 0.5);
+      phaseOffsets.add(math.Random(99 + i).nextDouble() * 2 * math.pi);
+    }
+  }
+
+  @override
+  void dispose() {
+    ctrl.dispose();
+    _animationController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: const Text('FastPath demo (core import)'),
+        actions: [
+          TextButton(
+            onPressed: () => setState(() {
+              fast = !fast;
+              ctrl.setUseFastPath(fast);
+            }),
+            child: Text(fast ? 'Switch to Baseline' : 'Switch to Fast Path', style: const TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          // 3D spheres visual
+          Positioned(
+            top: 50,
+            right: 50,
+            child: SizedBox(
+              width: 350,
+              height: 350,
+              child: Extreme3DAnimation(
+                controller: _animationController,
+                numSpheres: numSpheres,
+                rotationSpeeds: rotationSpeeds,
+                phaseOffsets: phaseOffsets,
+              ),
+            ),
+          ),
+
+          // USE THE CORE: FastPathWidget
+          FastPathWidget(
+            controller: ctrl,
+            onLatencySamples: (lats) => setState(() => samples = lats),
+            onClassifiedMove: (move) {
+              // app-level reaction: append a point to the drawing path
+              final last = drawPoints.isNotEmpty ? drawPoints.last : const Offset(200, 300);
+              final next = last + move.delta;
+              drawPoints.add(next);
+              if (drawPoints.length > 800) drawPoints.removeRange(0, drawPoints.length - 800);
+            },
+            child: CustomPaint(
+              painter: DrawPainter(drawPoints),
+              child: Container(color: Colors.transparent),
+            ),
+          ),
+
+          // mode indicator
+          Positioned(
+            top: 20,
+            left: 20,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: fast ? Colors.greenAccent.withOpacity(0.3) : Colors.redAccent.withOpacity(0.3),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                fast ? 'FAST PATH ACTIVE' : 'BASELINE MODE',
+                style: const TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.bold, color: Colors.white),
+              ),
+            ),
+          ),
+
+          // telemetry + slider
+          Positioned(
+            bottom: 20,
+            left: 20,
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              width: 360,
+              decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(8)),
+              child: DefaultTextStyle(
+                style: const TextStyle(fontFamily: 'monospace'),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Latency p50: ${_percentile(samples, 0.5)} ms'),
+                    const SizedBox(height: 6),
+                    Text('Samples: ${samples.take(10).join(', ')}'),
+                    const SizedBox(height: 6),
+                    Row(children: [
+                      const Text('Spheres: '),
+                      Expanded(
+                        child: Slider(
+                          min: 0,
+                          max: 400,
+                          divisions: 40,
+                          value: numSpheres.toDouble(),
+                          onChanged: (v) => setState(() => numSpheres = v.round()),
+                        ),
+                      ),
+                      Text('$numSpheres'),
+                    ]),
+                    const SizedBox(height: 10),
+                    ElevatedButton(onPressed: () => setState(() => samples.clear()), child: const Text('Clear Samples')),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  int _percentile(List<int> a, double p) {
+    if (a.isEmpty) return 0;
+    final sorted = List<int>.from(a)..sort();
+    final idx = ((sorted.length - 1) * p).round();
+    return sorted[idx];
+  }
+}
+
+class DrawPainter extends CustomPainter {
+  final List<Offset> pts;
+  DrawPainter(this.pts);
+
+  @override
+  void paint(Canvas c, Size s) {
+    final p = Paint()
+      ..color = Colors.blueAccent.withOpacity(0.6)
+      ..strokeWidth = 3
+      ..strokeCap = StrokeCap.round;
+    for (int i = 1; i < pts.length; i++) {
+      c.drawLine(pts[i - 1], pts[i], p);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant DrawPainter oldDelegate) => true;
+}
+
+class Extreme3DAnimation extends StatelessWidget {
+  final AnimationController controller;
+  final int numSpheres;
+  final List<double> rotationSpeeds;
+  final List<double> phaseOffsets;
+
+  const Extreme3DAnimation({
+    required this.controller,
+    required this.numSpheres,
+    required this.rotationSpeeds,
+    required this.phaseOffsets,
+    super.key,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, child) {
+        return Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.identity()..setEntry(3, 2, 0.003),
+          child: Stack(
+            alignment: Alignment.center,
+            children: List.generate(numSpheres, (i) {
+              final rs = rotationSpeeds[i % rotationSpeeds.length];
+              final ph = phaseOffsets[i % phaseOffsets.length];
+              final angle = controller.value * 2 * math.pi * rs + ph;
+              final radius = 20 + i % 20 * 8;
+              final dx = radius * math.cos(angle);
+              final dy = radius * math.sin(angle);
+              final size = 15 + (i % 5) * 8.toDouble();
+              return Transform.translate(
+                offset: Offset(dx, dy),
+                child: Container(
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    color: Colors.primaries[i % Colors.primaries.length].withOpacity(0.35),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              );
+            }),
+          ),
+        );
+      },
+    );
+  }
+}
